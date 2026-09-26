@@ -5,29 +5,231 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>地震台网事件编目与修订</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; background: #f9fafb; }
+    main { max-width: 960px; margin: auto; }
+    section { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    h1 { margin-bottom: .25rem; }
+    h2 { font-size: 1.05rem; margin: 0 0 .75rem; }
+    label { font-size: .85rem; color: #374151; }
+    input, select { padding: .4rem .5rem; border: 1px solid #d1d5db; border-radius: 6px; font-size: .9rem; }
+    button { padding: .45rem .8rem; cursor: pointer; border: 1px solid #2563eb; background: #2563eb; color: #fff; border-radius: 6px; font-size: .85rem; }
+    button.secondary { background: #fff; color: #2563eb; }
+    button.danger { border-color: #b91c1c; background: #b91c1c; }
+    .row { display: flex; flex-wrap: wrap; gap: .6rem; align-items: end; }
+    .field { display: flex; flex-direction: column; gap: .25rem; }
+    pre { background: #f3f4f6; padding: .75rem; border-radius: 8px; overflow-x: auto; font-size: .8rem; }
+    .error { background: #fef2f2; border: 1px solid #fecaca; color: #991b1b; padding: .6rem .8rem; border-radius: 8px; margin-top: .6rem; white-space: pre-wrap; }
+    .ok { color: #166534; }
+    table { width: 100%; border-collapse: collapse; font-size: .82rem; }
+    th, td { border-bottom: 1px solid #e5e7eb; padding: .45rem .4rem; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; color: #374151; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .tag { display: inline-block; padding: .1rem .45rem; border-radius: 999px; background: #e0e7ff; color: #3730a3; font-size: .75rem; }
+    .muted { color: #6b7280; font-size: .8rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>地震台网事件编目与修订</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+  <p class="muted">每次修改都保留改动前后的震级、状态与修订原因，连同提交人与时间按顺序可查；过期版本号提交将被拒绝，历史记录只追加、不可改动。</p>
+
+  <section>
+    <h2>1. 值班身份</h2>
+    <div class="row">
+      <div class="field"><label for="user">用户 ID</label><input id="user" value="reviewer-1"></div>
+      <div class="field"><label for="role">角色</label>
+        <select id="role">
+          <option value="reviewer" selected>reviewer（复核员）</option>
+          <option value="analyst">analyst（值班分析员）</option>
+          <option value="admin">admin（管理员）</option>
+          <option value="viewer">viewer（只读）</option>
+        </select>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 查看事件与修订链</h2>
+    <div class="row">
+      <div class="field"><label for="eventId">事件 ID</label><input id="eventId" style="min-width: 320px" placeholder="粘贴事件 ID，或用下方演示流程创建"></div>
+      <button onclick="loadEvent()">查看当前状态</button>
+      <button class="secondary" onclick="loadRevisions()">查看修订记录</button>
+    </div>
+    <div id="current"></div>
+  </section>
+
+  <section>
+    <h2>3. 提交动作（带乐观锁版本号）</h2>
+    <div class="row">
+      <div class="field"><label for="action">动作</label>
+        <select id="action">
+          <option value="associate">associate 关联</option>
+          <option value="review">review 复核</option>
+          <option value="publish">publish 发布</option>
+          <option value="revise">revise 修订</option>
+          <option value="withdraw">withdraw 撤回</option>
+        </select>
+      </div>
+      <div class="field"><label for="version">expected_version</label><input id="version" type="number" style="width: 9em"></div>
+      <div class="field"><label for="magnitude">震级</label><input id="magnitude" type="number" step="0.1" style="width: 8em"></div>
+      <div class="field"><label for="reason">修订原因 / 依据</label><input id="reason" style="min-width: 220px"></div>
+      <button onclick="submitAction()">提交</button>
+    </div>
+    <p class="muted">review 与 revise 需要震级和原因；publish 需要把发布文号填入“修订原因”；withdraw 需要撤回原因。故意填错版本号可观察过期版本提示，原记录不会被改动。</p>
+  </section>
+
+  <section>
+    <h2>修订记录（按时间顺序）</h2>
+    <div id="revisions" class="muted">尚未加载</div>
+  </section>
+
+  <section>
+    <h2>快捷演示</h2>
+    <div class="row">
+      <button class="secondary" onclick="runDemo()">创建演示事件并走完整流程</button>
+    </div>
+    <div id="message"></div>
+  </section>
+
+  <section>
+    <h2>接口</h2>
+    <pre class="mono">GET  /api/events/&lt;id&gt;/revisions      修订链（含发布、撤回、旧事件首次查看）
+GET  /api/entities/&lt;id&gt;/revisions    同上（别名）
+GET  /api/entities/&lt;id&gt;             当前状态
+POST /api/entities/&lt;id&gt;/actions     {"action","data","expected_version"}</pre>
+  </section>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const ACTION_LABEL = {
+  create: '创建', associate: '关联', review: '复核', publish: '发布',
+  revise: '修订', withdraw: '撤回', first_view: '旧事件首次查看'
+};
+const STATUS_LABEL = {
+  candidate: '候选', associated: '已关联', reviewed: '已复核',
+  published: '已发布', revised: '已修订', withdrawn: '已撤回'
+};
+
+function headers() {
+  return {
+    'Content-Type': 'application/json',
+    'X-User-Id': document.getElementById('user').value || 'anonymous',
+    'X-Role': document.getElementById('role').value
+  };
+}
+function showError(target, res) {
+  return res.json().then(body => {
+    const extra = body.current_version != null
+      ? `\n提交的版本号：${body.expected_version}，当前最新版本：${body.current_version}\n提示：${body.hint || ''}` : '';
+    document.getElementById(target).innerHTML = `<div class="error">${body.type}: ${body.error}${extra}</div>`;
+  });
+}
+function statusTag(s) { return `<span class="tag">${STATUS_LABEL[s] || s || '—'}</span>`; }
+function mag(v) { return v == null ? '<span class="muted">—</span>' : `<span class="mono">${v}</span>`; }
+
+async function loadEvent() {
+  const id = document.getElementById('eventId').value.trim();
+  if (!id) return;
+  const res = await fetch('/api/events/' + encodeURIComponent(id), { headers: headers() });
+  if (!res.ok) return showError('current', res);
+  const e = await res.json();
+  document.getElementById('version').value = e.version;
+  document.getElementById('current').innerHTML =
+    `<pre>${JSON.stringify(e, null, 2)}</pre>` +
+    `<p class="ok">已载入：状态 ${statusTag(e.status)}，版本 <span class="mono">${e.version}</span>，震级 ${mag(e.data && e.data.magnitude)}</p>`;
+  return loadRevisions();
+}
+
+async function loadRevisions() {
+  const id = document.getElementById('eventId').value.trim();
+  const target = document.getElementById('revisions');
+  if (!id) { target.textContent = '请先填写事件 ID'; return; }
+  const res = await fetch('/api/events/' + encodeURIComponent(id) + '/revisions', { headers: headers() });
+  if (!res.ok) {
+    const body = await res.json();
+    target.innerHTML = `<div class="error">${body.error}</div>`;
+    return;
+  }
+  const { items } = await res.json();
+  if (!items.length) { target.innerHTML = '<p class="muted">无记录</p>'; return; }
+  target.innerHTML = `<table><thead><tr>
+    <th>#</th><th>时间 (UTC)</th><th>动作</th><th>版本</th><th>状态</th><th>震级</th><th>修订原因</th><th>提交人</th>
+  </tr></thead><tbody>` + items.map(r => `<tr>
+    <td class="mono">${r.seq}</td>
+    <td class="mono">${r.created_at}</td>
+    <td>${ACTION_LABEL[r.action] || r.action}</td>
+    <td class="mono">${r.from_version == null ? '—' : r.from_version} → ${r.to_version}</td>
+    <td>${r.from_status ? statusTag(r.from_status) + ' → ' : ''}${statusTag(r.to_status)}</td>
+    <td>${mag(r.from_magnitude)} → ${mag(r.to_magnitude)}</td>
+    <td>${r.reason ? escapeHtml(r.reason) : '<span class="muted">—</span>'}</td>
+    <td class="mono">${escapeHtml(r.actor_id)} <span class="muted">(${r.actor_role})</span></td>
+  </tr>`).join('') + '</tbody></table>';
+}
+
+async function submitAction() {
+  const id = document.getElementById('eventId').value.trim();
+  const msg = document.getElementById('message');
+  if (!id) { msg.innerHTML = '<div class="error">请先填写事件 ID</div>'; return; }
+  const action = document.getElementById('action').value;
+  const expected_version = Number(document.getElementById('version').value);
+  const magnitude = document.getElementById('magnitude').value;
+  const reason = document.getElementById('reason').value.trim();
+  const data = {};
+  if (magnitude !== '') data.magnitude = Number(magnitude);
+  if (reason) data.reason = reason;
+  if (action === 'review') data.reviewer = document.getElementById('user').value;
+  if (action === 'publish') { data.communication_id = reason || 'COMM-1'; delete data.reason; }
+  const res = await fetch('/api/entities/' + encodeURIComponent(id) + '/actions', {
+    method: 'POST', headers: headers(),
+    body: JSON.stringify({ action, data, expected_version })
+  });
+  if (!res.ok) return showError('message', res);
+  msg.innerHTML = '<p class="ok">提交成功，已追加一条修订记录。</p>';
+  await loadEvent();
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function runDemo() {
+  const msg = document.getElementById('message');
+  msg.textContent = '正在创建演示事件…';
+  const adminHeaders = { 'Content-Type': 'application/json', 'X-User-Id': 'demo-admin', 'X-Role': 'admin' };
+  const create = await fetch('/api/events', {
+    method: 'POST', headers: adminHeaders,
+    body: JSON.stringify({
+      title: '演示事件 ' + new Date().toISOString(),
+      origin_time: '2026-09-26T00:00:00Z',
+      location: '示范区域',
+      reports: [
+        { station: 'STA-A', time_offset: 2, distance_km: 1.0 },
+        { station: 'STA-B', time_offset: -1, distance_km: 1.5 }
+      ]
+    })
+  });
+  if (!create.ok) return showError('message', create);
+  const event = await create.json();
+  document.getElementById('eventId').value = event.id;
+  document.getElementById('user').value = 'demo-admin';
+  document.getElementById('role').value = 'admin';
+  const steps = [
+    { action: 'associate', data: {} },
+    { action: 'review', data: { reviewer: 'R-1', magnitude: 4.2 } },
+    { action: 'publish', data: { communication_id: 'COMM-2026-001' } },
+    { action: 'revise', data: { reason: '新增台站数据，重新标定震级', magnitude: 4.5 } },
+  ];
+  let version = event.version;
+  for (const step of steps) {
+    const res = await fetch('/api/entities/' + event.id + '/actions', {
+      method: 'POST', headers: adminHeaders,
+      body: JSON.stringify({ action: step.action, data: step.data, expected_version: version })
+    });
+    if (!res.ok) return showError('message', res);
+    const updated = await res.json();
+    version = updated.version;
+  }
+  msg.innerHTML = '<p class="ok">演示流程完成：创建 → 关联 → 复核 → 发布 → 修订（4.2 → 4.5）。</p>';
+  await loadEvent();
 }
 </script>
 </body>

@@ -71,7 +71,14 @@ def create_handler(service, rules, static_dir):
                 status = 400
             else:
                 status = 500
-            self._send(status, {"error": str(exc), "type": type(exc).__name__})
+            payload = {"error": str(exc), "type": type(exc).__name__}
+            if isinstance(exc, ConflictError):
+                if exc.expected_version is not None:
+                    payload["expected_version"] = exc.expected_version
+                if exc.current_version is not None:
+                    payload["current_version"] = exc.current_version
+                payload["hint"] = "expected_version is stale; refetch the event and resubmit"
+            self._send(status, payload)
 
         def do_GET(self):
             try:
@@ -85,13 +92,25 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if (
+                    len(parts) == 4
+                    and parts[0] == "api"
+                    and parts[1] in ("events", "entities")
+                    and parts[3] == "revisions"
+                ):
+                    actor = self._actor()
+                    return self._send(
+                        200, {"items": service.revisions(parts[2], actor=actor)}
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
-                    return self._send(200, service.get(parts[2]))
+                    actor = self._actor()
+                    return self._send(200, service.get(parts[2], actor=actor))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
                     if len(parts) == 3:
-                        return self._send(200, service.get(parts[2]))
+                        actor = self._actor()
+                        return self._send(200, service.get(parts[2], actor=actor))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
                     return self._send(

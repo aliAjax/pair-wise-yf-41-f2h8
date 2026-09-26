@@ -1,8 +1,10 @@
 from uuid import uuid4
 
 from .audit import AuditTrail
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, ValidationError
 from .rules import RuleEngine
+
+EVENT_KIND = "event"
 
 
 class DomainService:
@@ -31,7 +33,24 @@ class DomainService:
         if self.repository.get_entity(entity_id):
             raise ConflictError("entity already exists: " + entity_id)
         status = self.rules.initial_status(kind)
-        entity = self.repository.create_entity(entity_id, kind, status, payload, actor.user_id)
+        revision = None
+        if kind == EVENT_KIND:
+            revision = self._revision(
+                entity_id=entity_id,
+                actor=actor,
+                action="create",
+                from_version=None,
+                to_version=1,
+                from_status=None,
+                to_status=status,
+                from_magnitude=None,
+                to_magnitude=payload.get("magnitude"),
+                reason=payload.get("note") or "事件创建",
+                detail={"kind": kind},
+            )
+        entity = self.repository.create_entity(
+            entity_id, kind, status, payload, actor.user_id, revision=revision
+        )
         self.audit.record(entity_id, actor, "create", None, status, {"kind": kind})
         if idempotency_key:
             self.repository.save_idempotency(actor.user_id, idempotency_key, entity_id)
@@ -42,12 +61,40 @@ class DomainService:
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
         expected = int(expected_version) if expected_version is not None else entity["version"]
+        # Reject stale submissions up front so the stored record and its
+        # revision history are never touched by an out-of-date edit.
+        if expected != entity["version"]:
+            raise ConflictError(
+                "stale version: expected_version %s is out of date, "
+                "current version is %s; refetch and resubmit"
+                % (expected, entity["version"]),
+                expected_version=expected,
+                current_version=entity["version"],
+            )
+        payload = dict(data or {})
         next_status, patch = self.rules.validate_transition(
-            actor, entity, action, dict(data or {}), self._lookup
+            actor, entity, action, payload, self._lookup
         )
         merged = dict(entity["data"])
         merged.update(patch)
-        updated = self.repository.update_entity(entity_id, expected, next_status, merged)
+        revision = None
+        if entity["kind"] == EVENT_KIND:
+            revision = self._revision(
+                entity_id=entity_id,
+                actor=actor,
+                action=action,
+                from_version=entity["version"],
+                to_version=entity["version"] + 1,
+                from_status=entity["status"],
+                to_status=next_status,
+                from_magnitude=entity["data"].get("magnitude"),
+                to_magnitude=merged.get("magnitude"),
+                reason=payload.get("reason") or payload.get("communication_id") or action,
+                detail={"patch": patch},
+            )
+        updated = self.repository.update_entity(
+            entity_id, expected, next_status, merged, revision=revision
+        )
         self.audit.record(
             entity_id,
             actor,
@@ -58,11 +105,35 @@ class DomainService:
         )
         return updated
 
-    def get(self, entity_id):
+    @staticmethod
+    def _revision(**kwargs):
+        actor = kwargs.pop("actor")
+        kwargs["actor_id"] = actor.user_id
+        kwargs["actor_role"] = actor.role
+        for key in ("from_magnitude", "to_magnitude"):
+            value = kwargs.get(key)
+            if value is not None:
+                kwargs[key] = str(value)
+        kwargs.setdefault("detail", {})
+        return kwargs
+
+    def get(self, entity_id, actor=None):
         entity = self.repository.get_entity(entity_id)
         if not entity:
             raise NotFoundError("entity not found: " + entity_id)
+        if actor is not None and entity["kind"] == EVENT_KIND:
+            self.repository.ensure_event_baseline(entity, actor)
         return entity
+
+    def revisions(self, entity_id, actor=None):
+        entity = self.repository.get_entity(entity_id)
+        if not entity:
+            raise NotFoundError("entity not found: " + entity_id)
+        if entity["kind"] != EVENT_KIND:
+            raise ValidationError("revisions are only available for events")
+        if actor is not None:
+            self.repository.ensure_event_baseline(entity, actor)
+        return self.repository.list_revisions(entity_id)
 
     def list(self, kind=None, status=None):
         if kind:
