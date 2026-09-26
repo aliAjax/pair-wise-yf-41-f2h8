@@ -23,6 +23,26 @@ class ConflictError(DomainError):
     """A version or uniqueness constraint was violated."""
 
 
+class StaleVersionError(ConflictError):
+    """Submitter based the change on an out-of-date expected_version."""
+
+    def __init__(self, expected_version, current_version):
+        self.expected_version = int(expected_version)
+        self.current_version = int(current_version)
+        if self.expected_version < self.current_version:
+            message = (
+                "stale version: expected_version %s is out of date, current version is %s; "
+                "reload the latest record and resubmit"
+                % (self.expected_version, self.current_version)
+            )
+        else:
+            message = (
+                "version conflict: expected_version %s does not exist, current version is %s"
+                % (self.expected_version, self.current_version)
+            )
+        super().__init__(message)
+
+
 class InvalidTransition(DomainError):
     """The requested state transition is not valid."""
 

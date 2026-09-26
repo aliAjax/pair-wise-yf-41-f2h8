@@ -10,6 +10,7 @@ from .domain import (
     InvalidTransition,
     NotFoundError,
     PermissionDenied,
+    StaleVersionError,
     ValidationError,
     Actor,
 )
@@ -63,6 +64,17 @@ def create_handler(service, rules, static_dir):
                 status = 403
             elif isinstance(exc, NotFoundError):
                 status = 404
+            elif isinstance(exc, StaleVersionError):
+                status = 409
+                return self._send(
+                    status,
+                    {
+                        "error": str(exc),
+                        "type": "StaleVersionError",
+                        "expected_version": exc.expected_version,
+                        "current_version": exc.current_version,
+                    },
+                )
             elif isinstance(exc, (ConflictError, InvalidTransition)):
                 status = 409
             elif isinstance(exc, ValidationError):
@@ -85,12 +97,34 @@ def create_handler(service, rules, static_dir):
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
                     return self._send(200, {"items": service.audit_log()})
+                if len(parts) == 4 and parts[0] == "api" and parts[3] == "revisions":
+                    actor = self._actor()
+                    if parts[1] in ("events", "entities"):
+                        return self._send(
+                            200,
+                            {"items": service.event_revisions(parts[2], actor=actor)},
+                        )
+                    raise NotFoundError("not found")
+                if (
+                    len(parts) == 5
+                    and parts[0] == "api"
+                    and parts[3] == "revisions"
+                    and parts[1] in ("events", "entities")
+                ):
+                    actor = self._actor()
+                    return self._send(
+                        200, service.event_revision(parts[2], parts[4], actor=actor)
+                    )
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
-                    return self._send(200, service.get(parts[2]))
+                    return self._send(200, service.get(parts[2], actor=self._actor()))
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
                     if len(parts) == 3:
+                        if parts[1] == "events":
+                            return self._send(
+                                200, service.get(parts[2], actor=self._actor())
+                            )
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]

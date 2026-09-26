@@ -2,7 +2,7 @@ import json
 import sqlite3
 from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
+from .domain import ConflictError, NotFoundError, StaleVersionError
 
 
 def utcnow():
@@ -54,6 +54,26 @@ class SQLiteRepository:
                     created_at TEXT NOT NULL,
                     PRIMARY KEY(actor_id, idem_key)
                 );
+                CREATE TABLE IF NOT EXISTS event_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    from_version INTEGER,
+                    to_version INTEGER NOT NULL,
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    from_magnitude REAL,
+                    to_magnitude REAL,
+                    reason TEXT,
+                    actor_id TEXT NOT NULL,
+                    actor_role TEXT NOT NULL,
+                    snapshot TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(entity_id, seq)
+                );
+                CREATE INDEX IF NOT EXISTS idx_event_revisions_entity
+                    ON event_revisions(entity_id, seq);
             """)
 
     @staticmethod
@@ -69,15 +89,25 @@ class SQLiteRepository:
             "updated_at": row["updated_at"],
         }
 
-    def create_entity(self, entity_id, kind, status, data, actor_id):
+    def create_entity(self, entity_id, kind, status, data, actor_id, revision=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self._connect() as connection:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 "INSERT INTO entities(id, kind, status, version, data, created_by, created_at, updated_at) "
                 "VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
                 (entity_id, kind, status, payload, actor_id, now, now),
             )
+            if revision is not None:
+                self._insert_revision(connection, entity_id, revision, now)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
         return self.get_entity(entity_id)
 
     def get_entity(self, entity_id):
@@ -110,7 +140,7 @@ class SQLiteRepository:
             if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
         ]
 
-    def update_entity(self, entity_id, expected_version, status, data):
+    def update_entity(self, entity_id, expected_version, status, data, revision=None):
         now = utcnow()
         payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
         connection = self._connect()
@@ -123,15 +153,14 @@ class SQLiteRepository:
                 raise NotFoundError("entity not found: " + entity_id)
             current_version = int(row["version"])
             if expected_version is not None and current_version != int(expected_version):
-                raise ConflictError(
-                    "version conflict: expected %s, found %s"
-                    % (expected_version, current_version)
-                )
+                raise StaleVersionError(expected_version, current_version)
             connection.execute(
                 "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
                 "WHERE id = ? AND version = ?",
                 (status, payload, now, entity_id, current_version),
             )
+            if revision is not None:
+                self._insert_revision(connection, entity_id, revision, now)
             connection.commit()
         except Exception:
             connection.rollback()
@@ -156,6 +185,125 @@ class SQLiteRepository:
                     utcnow(),
                 ),
             )
+
+    @staticmethod
+    def _revision_from_row(row):
+        return {
+            "id": row["id"],
+            "entity_id": row["entity_id"],
+            "seq": int(row["seq"]),
+            "action": row["action"],
+            "from_version": row["from_version"],
+            "to_version": int(row["to_version"]),
+            "from_status": row["from_status"],
+            "to_status": row["to_status"],
+            "from_magnitude": row["from_magnitude"],
+            "to_magnitude": row["to_magnitude"],
+            "reason": row["reason"],
+            "actor_id": row["actor_id"],
+            "actor_role": row["actor_role"],
+            "snapshot": json.loads(row["snapshot"]),
+            "created_at": row["created_at"],
+        }
+
+    def _insert_revision(self, connection, entity_id, revision, now):
+        """Insert one revision; to_version/seq are derived from the entity row.
+
+        revision keys: action, from_version, from_status, to_status,
+        from_magnitude, to_magnitude, reason, actor_id, actor_role, snapshot
+        """
+        row = connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        to_version = int(row["version"])
+        seq_row = connection.execute(
+            "SELECT COALESCE(MAX(seq), 0) AS max_seq FROM event_revisions WHERE entity_id = ?",
+            (entity_id,),
+        ).fetchone()
+        seq = int(seq_row["max_seq"]) + 1
+        connection.execute(
+            "INSERT INTO event_revisions("
+            "entity_id, seq, action, from_version, to_version, from_status, to_status, "
+            "from_magnitude, to_magnitude, reason, actor_id, actor_role, snapshot, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                seq,
+                revision["action"],
+                revision.get("from_version"),
+                to_version,
+                revision.get("from_status"),
+                revision["to_status"],
+                revision.get("from_magnitude"),
+                revision.get("to_magnitude"),
+                revision.get("reason"),
+                revision["actor_id"],
+                revision["actor_role"],
+                json.dumps(revision.get("snapshot") or {}, ensure_ascii=False, sort_keys=True),
+                now,
+            ),
+        )
+
+    def append_event_revision(self, entity_id, revision):
+        now = utcnow()
+        with self._connect() as connection:
+            self._insert_revision(connection, entity_id, revision, now)
+
+    def ensure_legacy_event_baseline(self, entity_id, actor_id, actor_role, reason):
+        """Insert a first-view baseline for an event that predates revision tracking.
+
+        Returns True when a baseline was inserted, False when one already exists.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute(
+                "SELECT 1 FROM event_revisions WHERE entity_id = ? LIMIT 1", (entity_id,)
+            ).fetchone()
+            if exists:
+                connection.commit()
+                return False
+            entity_row = connection.execute(
+                "SELECT status, version, data FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            entity_data = json.loads(entity_row["data"])
+            revision = {
+                "action": "first_view",
+                "from_version": int(entity_row["version"]),
+                "from_status": entity_row["status"],
+                "to_status": entity_row["status"],
+                "from_magnitude": entity_data.get("magnitude"),
+                "to_magnitude": entity_data.get("magnitude"),
+                "reason": reason,
+                "actor_id": actor_id,
+                "actor_role": actor_role,
+                "snapshot": entity_data,
+            }
+            self._insert_revision(connection, entity_id, revision, now)
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def list_event_revisions(self, entity_id):
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM event_revisions WHERE entity_id = ? ORDER BY seq",
+                (entity_id,),
+            ).fetchall()
+        return [self._revision_from_row(row) for row in rows]
+
+    def get_event_revision(self, entity_id, seq):
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM event_revisions WHERE entity_id = ? AND seq = ?",
+                (entity_id, int(seq)),
+            ).fetchone()
+        return self._revision_from_row(row) if row else None
 
     def list_audit(self, entity_id=None):
         with self._connect() as connection:
